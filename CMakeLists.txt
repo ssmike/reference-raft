@@ -29,5 +29,4 @@ target_link_libraries(main ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES}
     ${spdlog_LIBRARIES} fmt::fmt bus)
 
 add_executable(client client.cpp ${PROTO_HDRS} ${PROTO_SRCS})
-target_include_directories(client PUBLIC ${JSONCPP_INCLUDE_DIRS})
 target_link_libraries(client ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES} bus)
