@@ -235,6 +235,16 @@ private:
         std::chrono::system_clock::time_point latest_heartbeat_;
         std::optional<uint64_t> leader_id_;
 
+        std::vector<bus::Promise<bool>> pick_subscribers() {
+            std::vector<bus::Promise<bool>> subscribers;
+            while (!commit_subscribers_.empty() && commit_subscribers_.begin()->first <= applied_ts_) {
+                spdlog::debug("fire commit subscriber for ts={0:d}", commit_subscribers_.begin()->first);
+                subscribers.push_back(commit_subscribers_.begin()->second);
+                commit_subscribers_.erase(commit_subscribers_.begin());
+            }
+            return subscribers;
+        }
+
         Response create_response(bool success) {
             Response response;
             response.set_term(current_term_);
@@ -499,6 +509,7 @@ private:
                                     state->role_ = kLeader;
                                     state->advance_applied_timestmap();
                                     spdlog::info("becoming leader applied up to {0:d}", state->applied_ts_);
+                                    state->commit_subscribers_.clear();
                                     state->durable_timestamps_.assign(options_.members, state->applied_ts_);
                                     state->next_timestamps_.assign(options_.members, state->applied_ts_ + 1);
                                 }
@@ -693,11 +704,7 @@ private:
                                     spdlog::debug("node {2:d} responded with next_ts={0:d} durable_ts={1:d}", response.next_ts(), response.durable_ts(), id);
                                 }
                                 state->advance_applied_timestmap();
-                                while (!state->commit_subscribers_.empty() && state->commit_subscribers_.begin()->first <= state->applied_ts_) {
-                                    spdlog::debug("fire commit subscriber for ts={0:d}", state->commit_subscribers_.begin()->first);
-                                    subscribers.push_back(state->commit_subscribers_.begin()->second);
-                                    state->commit_subscribers_.erase(state->commit_subscribers_.begin());
-                                }
+                                subscribers = state->pick_subscribers();
                             } else {
                                 spdlog::debug("node {0:d} failed heartbeat", id);
                             }
@@ -782,7 +789,18 @@ private:
         }
         log->sync();
 
-        state_.get()->durable_ts_ = durable_ts;
+        std::vector<bus::Promise<bool>> subscribers;
+        {
+            auto state = state_.get();
+            state->durable_ts_ = durable_ts;
+            if (state->role_ == kLeader) {
+                state->advance_applied_timestmap();
+                subscribers = state->pick_subscribers();
+            }
+        }
+        for (auto& sub : subscribers) {
+            sub.set_value_once(true);
+        }
 
         to_deliver.set_value_once(true);
     }
