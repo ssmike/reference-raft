@@ -1045,6 +1045,7 @@ int main(int argc, char** argv) {
     options.bus_options.batch_opts.max_batch = conf["max_batch"].asInt();
     options.bus_options.batch_opts.max_delay = parse_duration(conf["max_delay"]);
     size_t id = conf["id"].asInt();
+    srand(id);
     options.bus_options.greeter = id;
     options.bus_options.tcp_opts.port = conf["port"].asInt();
     options.bus_options.tcp_opts.fixed_pool_size = conf["pool_size"].asUInt64();
