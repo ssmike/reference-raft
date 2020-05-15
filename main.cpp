@@ -25,6 +25,11 @@
 
 using duration = std::chrono::system_clock::duration;
 
+bool exists(std::string_view fname) {
+    struct stat buf;
+    return (stat(fname.data(), &buf) == 0);
+}
+
 class DescriptorHolder {
 public:
     static constexpr int kInvalidFd = -1;
@@ -38,10 +43,18 @@ public:
 
     void set(int fd) {
         if (fd_ != kInvalidFd && fd != fd_) {
-            close(fd_);
+            ::close(fd_);
         }
         FATAL(fd < 0);
         fd_ = fd;
+    }
+
+    void close() {
+        if (fd_ != kInvalidFd) {
+            ::close(fd_);
+            fd_ = kInvalidFd;
+        }
+
     }
 
     int operator* () {
@@ -49,9 +62,7 @@ public:
     }
 
     ~DescriptorHolder() {
-        if (fd_ != kInvalidFd) {
-            close(fd_);
-        }
+        this->close();
     }
 
 private:
@@ -70,6 +81,11 @@ public:
 
     void set_fd(int fd) {
         fd_.set(fd);
+        data_ptr_ = consumed_ptr_ = 0;
+    }
+
+    void close() {
+        fd_.close();
         data_ptr_ = consumed_ptr_ = 0;
     }
 
@@ -174,8 +190,7 @@ public:
     }
 
     std::optional<VoteRpc> recover() {
-        struct stat buf;
-        if (stat(fname_.c_str(), &buf) != 0) return std::nullopt;
+        if (!exists(fname_)) return std::nullopt;
         DescriptorHolder fd{open(fname_.c_str(), O_RDONLY)};
         uint64_t sz;
         FATAL(read(*fd, &sz, sizeof(sz)) != sizeof(sz));
@@ -207,6 +222,10 @@ private:
 
 private:
     struct State {
+        BufferedFile recovery_snapshot_io_;
+        std::optional<std::pair<int64_t, int64_t>> recovery_snapshot_id_;
+        uint64_t recovery_snapshot_size_;
+
         uint64_t id_;
 
         size_t current_term_ = 0;
@@ -349,15 +368,46 @@ public:
 private:
     void handle_recovery_snapshot(RecoverySnapshot s) {
         auto state = state_.get();
+        if (state->role_ != kFollower) {
+            return;
+        }
+
+        if (s.applied_ts() < state->applied_ts_ || s.term() != state->current_term_) {
+            return;
+        }
+
+        std::pair<int64_t, int64_t> id = {s.term(), s.applied_ts()};
+        if (!state->recovery_snapshot_id_ || *state->recovery_snapshot_id_ != id) {
+            state->recovery_snapshot_io_.close();
+            state->recovery_snapshot_id_ = id;
+            // assert(!exists(snapshot_name(state->current_changelog_)));
+            // 2nd attempts could do it
+            state->recovery_snapshot_io_.set_fd(open(snapshot_name(s.applied_ts()).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR));
+            state->recovery_snapshot_size_ = s.size();
+            state->recovery_snapshot_io_.write_uint64(state->recovery_snapshot_size_);
+            state->recovery_snapshot_io_.write_uint64(s.applied_ts());
+        }
 
         for (auto& op : s.operations()) {
             state->fsm_[op.key()] = op.value();
+            LogRecord rec;
+            auto rec_op = rec.add_operations();
+            rec_op->set_key(op.key());
+            rec_op->set_value(op.value());
+            state->recovery_snapshot_io_.write_log_record(rec);
+            --state->recovery_snapshot_size_;
         }
 
-        if (s.should_set_applied_ts()) {
-            state->applied_ts_ = s.applied_ts();
-            state->durable_ts_ = std::max(state->durable_ts_, state->applied_ts_);
-            state->next_ts_ = state->durable_ts_ + 1;
+        if (s.end()) {
+            if (state->recovery_snapshot_size_ == 0) {
+                state->recovery_snapshot_io_.sync();
+                state->applied_ts_ = s.applied_ts();
+                state->durable_ts_ = std::max(state->durable_ts_, state->applied_ts_);
+                state->next_ts_ = state->durable_ts_ + 1;
+            } else {
+                state->recovery_snapshot_io_.close();
+                state->recovery_snapshot_id_ = std::nullopt;
+            }
         }
     }
 
@@ -570,7 +620,9 @@ private:
     void recover_stale_nodes() {
         std::vector<size_t> nodes;
         std::vector<int64_t> nexts;
+        uint64_t term;
         if (auto state = state_.get(); state->role_ == kLeader) {
+            term = state->current_term_;
             for (size_t id = 0; id < options_.members; ++id) {
                 int64_t ts = !state->buffered_log_.empty() ? state->buffered_log_[0].ts() : state->applied_ts_;
                 if (id_ != id) {
@@ -580,6 +632,8 @@ private:
                     }
                 }
             }
+        } else {
+            return;
         }
 
         BufferedFile io;
@@ -600,14 +654,16 @@ private:
                             op->set_key(item.first);
                             op->set_value(item.second);
                             if (rec.operations_size() >= options_.rpc_max_batch) {
+                                rec.set_applied_ts(ts);
                                 if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
                                     return;
                                 }
                                 rec.Clear();
                             }
                         }
+                        rec.set_term(term);
                         rec.set_applied_ts(ts);
-                        rec.set_should_set_applied_ts(true);
+                        rec.set_end(true);
                         if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
                             return;
                         }
@@ -914,17 +970,20 @@ private:
     }
 
     void rotate() {
-        size_t changelog_number;
+        uint64_t snapshot_number;
         // sync calls under lock cos don't want to deal with partial states
         {
             auto log = log_.get();
             auto state = state_.get();
-            changelog_number = ++state->current_changelog_;
-            log->set_fd(open(changelog_name(changelog_number).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR));
+            if (state->applied_ts_ < 0) {
+                return;
+            }
+            snapshot_number = state->applied_ts_;
+            log->set_fd(open(changelog_name(++state->current_changelog_).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR));
             log->write_uint64(state->durable_ts_);
         }
         // here we go dumpin'
-        BufferedFile snapshot{open(snapshot_name(changelog_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)};
+        BufferedFile snapshot{open(snapshot_name(snapshot_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)};
         State& unsafe_state_ptr = *state_.get();
         bus::SharedView preallocated_arena_buf(buffer_pool_, options_.bus_options.tcp_opts.max_message_size);
         if (pid_t child = fork()) {

@@ -33,10 +33,11 @@ message Response {
 
 
 message RecoverySnapshot {
-    uint64 seq_id = 1;
-    uint64 snapshot_id = 2;
-    repeated Operation operations = 3;
+    uint64 size = 1;
+    bool end = 3;
 
-    bool should_set_applied_ts = 4;
+    repeated Operation operations = 4;
+
     uint64 applied_ts = 5; 
+    int64 term = 6;
 };
