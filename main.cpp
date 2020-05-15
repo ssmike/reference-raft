@@ -703,19 +703,20 @@ private:
             spdlog::info("replaying logs for {0:d} from ts={1:d}", node, next);
             auto changelogs = discover_changelogs();
             std::vector<LogRecord> records;
+            std::reverse(changelogs.begin(), changelogs.end());
             for (size_t changelog : changelogs) {
                 io.set_fd(open(changelog_name(changelog).c_str(), O_RDONLY));
                 if (auto ts = io.read_int64()) {
                     spdlog::debug("open changelog {0:d}, limit ts={1:d}", changelog, *ts);
-                    if (*ts < next) {
-                        continue;
-                    }
                     iterate_changelog(io, [&](LogRecord rec) {
                             if (rec.ts() >= next) {
                                 records.resize(std::max<size_t>(records.size(), rec.ts() - next + 1));
                                 records[rec.ts() - next] = std::move(rec);
                             }
                         });
+                    if (*ts < next) {
+                        break;
+                    }
                 }
             }
             uint64_t term;
@@ -738,10 +739,10 @@ private:
                 }
                 auto response = send<AppendRpcs, Response>(std::move(rpc), node, kAppendRpcs, options_.heartbeat_timeout).wait();
                 if (!response || !response.unwrap().success()) {
-                    new_next = response.unwrap().next_ts();
                     spdlog::debug("failing to send changelogs");
                     return;
                 }
+                new_next = response.unwrap().next_ts();
             }
             spdlog::info("successful recovery acknowledged timstamp {0:d}", new_next);
             {
@@ -977,21 +978,14 @@ private:
         }
 
         size_t first_changelog = 0;
-        for (size_t i = 0; i < changelogs.size(); ++i) {
-            auto fname = changelog_name(changelogs[i]);
+        std::reverse(changelogs.begin(), changelogs.end());
+        for (auto changelog : changelogs) {
+            auto fname = changelog_name(changelog);
             io.set_fd(open(fname.c_str(), O_RDONLY));
-            auto durable_ts = io.read_int64();
-            if (durable_ts) {
-                spdlog::debug("opened changelog {1:d} limit ts={0:d}", *durable_ts, changelogs[i]);
+            auto ts = io.read_int64();
+            if (ts) {
+                spdlog::debug("opened changelog {1:d} limit ts={0:d}", *ts, changelog);
             }
-            if (durable_ts && *durable_ts < state->applied_ts_) {
-                first_changelog = i;
-            }
-        }
-        for (size_t i = first_changelog; i < changelogs.size(); ++i) {
-            auto fname = changelog_name(changelogs[i]);
-            io.set_fd(open(fname.c_str(), O_RDONLY));
-            if (!io.read_int64()) continue;
             iterate_changelog(io,
                 [&](auto rec) {
                     if (rec.ts() > state->applied_ts_) {
@@ -1001,6 +995,9 @@ private:
                         state->durable_ts_ = std::max<ssize_t>(state->durable_ts_, rec.ts());
                     }
                 });
+            if (*ts <= state->applied_ts_) {
+                break;
+            }
         }
         {
             auto log = log_.get();
