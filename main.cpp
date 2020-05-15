@@ -372,12 +372,11 @@ private:
             return state->create_response(false);
         }
 
-        if (s.applied_ts() < state->applied_ts_ || s.term() != state->current_term_) {
+        if (s.applied_ts() <= state->applied_ts_ || s.term() != state->current_term_) {
             spdlog::info("ignore snapshot with ts={0:d}, term={1:d} my ts={2:d} term={3:d}", s.applied_ts(), s.term(), state->applied_ts_, state->current_term_);
             return state->create_response(false);
         }
 
-        //spdlog::info("handle recovery");
         std::pair<int64_t, int64_t> id = {s.term(), s.applied_ts()};
         if (!state->recovery_snapshot_id_ || *state->recovery_snapshot_id_ != id) {
             if (!s.start()) {
@@ -572,7 +571,9 @@ private:
                                     state->advance_applied_timestamp();
                                     spdlog::info("becoming leader applied up to {0:d}", state->applied_ts_);
                                     state->commit_subscribers_.clear();
-                                    state->durable_timestamps_.assign(options_.members, state->applied_ts_);
+                                    for (auto & ts : state->durable_timestamps_) {
+                                        ts = std::min(ts, state->applied_ts_);
+                                    }
                                     state->next_timestamps_.assign(options_.members, state->applied_ts_ + 1);
                                 }
                             }
@@ -640,7 +641,7 @@ private:
                 if (id_ != id) {
                     if (state->next_timestamps_[id] < ts) {
                         nodes.push_back(id);
-                        nexts.push_back(id);
+                        nexts.push_back(state->next_timestamps_[id]);
                     }
                 }
             }
@@ -663,7 +664,12 @@ private:
                         first_portion = false;
                         auto f = send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout);
                         auto& response = f.wait();
-                        return response && response.unwrap().success();
+                        if (!response || !response.unwrap().success()) {
+                            spdlog::debug("failing to send snapshot");
+                            return false;
+                        } else {
+                            return true;
+                        }
                     };
                     if (next <= ts) {
                         spdlog::info("sending snapshot for ts={0:d} to {1:d}", ts, node);
@@ -691,9 +697,8 @@ private:
                         next = ts + 1;
                         break;
                     }
-                } else {
-                    snapshots.pop_back();
                 }
+                snapshots.pop_back();
             }
             spdlog::info("replaying logs for {0:d} from ts={1:d}", node, next);
             auto changelogs = discover_changelogs();
@@ -702,7 +707,7 @@ private:
                 io.set_fd(open(changelog_name(changelog).c_str(), O_RDONLY));
                 if (auto ts = io.read_uint64()) {
                     if (ts < next) {
-                        return;
+                        continue;
                     }
                     iterate_changelog(io, [&](LogRecord rec) {
                             records.resize(std::max<size_t>(records.size(), rec.ts() + 1));
@@ -710,22 +715,35 @@ private:
                         });
                 }
             }
+            uint64_t term;
+            {
+                auto state = state_.get();
+                term = state->current_term_;
+                if (state->role_ != kLeader) {
+                    return;
+                }
+            }
+            int64_t new_next = next;
             for (size_t i = 0; i < records.size(); i += options_.rpc_max_batch) {
                 size_t start = i;
                 size_t end = std::min<size_t>(start + options_.rpc_max_batch, records.size());
                 AppendRpcs rpc;
-                {
-                    auto state = state_.get();
-                    rpc.set_term(state->current_term_);
-                    if (state->role_ != kLeader) {
-                        return;
-                    }
-                }
+                rpc.set_term(term);
                 spdlog::debug("sending changelogs from {0:d} to {1:d}", records[start].ts(), records[end - 1].ts());
                 for (size_t j = start; j < end; ++j) {
                     *rpc.add_records() = std::move(records[j]);
                 }
-                send<AppendRpcs, Response>(std::move(rpc), node, kAppendRpcs, options_.heartbeat_timeout).wait();
+                auto response = send<AppendRpcs, Response>(std::move(rpc), node, kAppendRpcs, options_.heartbeat_timeout).wait();
+                if (!response || !response.unwrap().success()) {
+                    new_next = response.unwrap().next_ts();
+                    spdlog::debug("failing to send changelogs");
+                    return;
+                }
+            }
+            spdlog::info("successful recovery acknowledged timstamp {0:d}", new_next);
+            {
+                auto state = state_.get();
+                state->next_timestamps_[node] = std::max(state->next_timestamps_[node], new_next);
             }
         };
 
@@ -1049,6 +1067,7 @@ private:
     bus::internal::ExclusiveWrapper<BufferedFile> log_;
 
     uint64_t id_;
+    uint64_t snapshot_id = 0;
 
     bus::internal::Event shot_down_;
 };
