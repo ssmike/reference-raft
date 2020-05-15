@@ -122,13 +122,13 @@ public:
         consumed_ptr_ = data_ptr_ = 0;
     }
 
-    void write_uint64(uint64_t val) {
+    void write_int64(int64_t val) {
         auto ptr = reserve(sizeof(val));
         memcpy(&buffer_[ptr], &val, sizeof(val));
     }
 
-    std::optional<uint64_t> read_uint64() {
-        uint64_t val;
+    std::optional<int64_t> read_int64() {
+        int64_t val;
         if (auto ptr = fetch(sizeof(val))) {
             memcpy(&val, &buffer_[*ptr], sizeof(val));
             return val;
@@ -138,7 +138,7 @@ public:
     }
 
     std::optional<LogRecord> read_log_record() {
-        auto header = read_uint64();
+        auto header = read_int64();
         if (!header) { return std::nullopt; }
         if (auto ptr = fetch(*header)) {
             LogRecord record;
@@ -151,7 +151,7 @@ public:
 
     void write_log_record(const LogRecord& record) {
         auto sz = record.ByteSizeLong();
-        write_uint64(sz);
+        write_int64(sz);
         auto ptr = reserve(sz);
         FATAL(!record.SerializeToArray(&buffer_[ptr], sz));
     }
@@ -389,8 +389,8 @@ private:
             // 2nd attempts could do it
             state->recovery_snapshot_io_.set_fd(open(snapshot_name(s.applied_ts()).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR));
             state->recovery_snapshot_size_ = s.size();
-            state->recovery_snapshot_io_.write_uint64(state->recovery_snapshot_size_);
-            state->recovery_snapshot_io_.write_uint64(s.applied_ts());
+            state->recovery_snapshot_io_.write_int64(state->recovery_snapshot_size_);
+            state->recovery_snapshot_io_.write_int64(s.applied_ts());
             spdlog::info("start writing snapshot for ts={0:d}; size={1:d}", s.applied_ts(), s.size());
         }
 
@@ -705,13 +705,16 @@ private:
             std::vector<LogRecord> records;
             for (size_t changelog : changelogs) {
                 io.set_fd(open(changelog_name(changelog).c_str(), O_RDONLY));
-                if (auto ts = io.read_uint64()) {
-                    if (ts < next) {
+                if (auto ts = io.read_int64()) {
+                    spdlog::debug("open changelog {0:d}, limit ts={1:d}", changelog, *ts);
+                    if (*ts < next) {
                         continue;
                     }
                     iterate_changelog(io, [&](LogRecord rec) {
-                            records.resize(std::max<size_t>(records.size(), rec.ts() + 1));
-                            records[rec.ts() - next - 1] = std::move(rec);
+                            if (rec.ts() >= next) {
+                                records.resize(std::max<size_t>(records.size(), rec.ts() - next + 1));
+                                records[rec.ts() - next] = std::move(rec);
+                            }
                         });
                 }
             }
@@ -904,8 +907,8 @@ private:
         auto fname = snapshot_name(number);
         io.set_fd(open(fname.c_str(), O_RDONLY));
         bool valid = true;
-        std::optional<uint64_t> size = io.read_uint64();
-        std::optional<uint64_t> applied = io.read_uint64();
+        std::optional<uint64_t> size = io.read_int64();
+        std::optional<uint64_t> applied = io.read_int64();
         if (!size.has_value() || !applied.has_value()) {
             return false;
         }
@@ -977,7 +980,10 @@ private:
         for (size_t i = 0; i < changelogs.size(); ++i) {
             auto fname = changelog_name(changelogs[i]);
             io.set_fd(open(fname.c_str(), O_RDONLY));
-            auto durable_ts = io.read_uint64();
+            auto durable_ts = io.read_int64();
+            if (durable_ts) {
+                spdlog::debug("opened changelog {1:d} limit ts={0:d}", *durable_ts, changelogs[i]);
+            }
             if (durable_ts && *durable_ts < state->applied_ts_) {
                 first_changelog = i;
             }
@@ -985,7 +991,7 @@ private:
         for (size_t i = first_changelog; i < changelogs.size(); ++i) {
             auto fname = changelog_name(changelogs[i]);
             io.set_fd(open(fname.c_str(), O_RDONLY));
-            if (!io.read_uint64()) continue;
+            if (!io.read_int64()) continue;
             iterate_changelog(io,
                 [&](auto rec) {
                     if (rec.ts() > state->applied_ts_) {
@@ -999,7 +1005,7 @@ private:
         {
             auto log = log_.get();
             log->set_fd(open(changelog_name(state->current_changelog_).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR));
-            io.write_uint64(state->durable_ts_);
+            log->write_int64(state->durable_ts_);
         }
         if (auto vote = vote_keeper_.get()->recover()) {
             state->current_term_ = vote->term();
@@ -1018,8 +1024,8 @@ private:
                 return;
             }
             snapshot_number = state->applied_ts_;
-            log->set_fd(open(changelog_name(++state->current_changelog_).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR));
-            log->write_uint64(state->durable_ts_);
+            log->set_fd(open(changelog_name(++state->current_changelog_).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR));
+            log->write_int64(state->durable_ts_);
         }
         // here we go dumpin'
         BufferedFile snapshot{open(snapshot_name(snapshot_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)};
@@ -1033,8 +1039,8 @@ private:
             FATAL(WEXITSTATUS(wstatus) != 0);
         } else {
             State& state = unsafe_state_ptr;
-            snapshot.write_uint64(state.fsm_.size());
-            snapshot.write_uint64(state.applied_ts_);
+            snapshot.write_int64(state.fsm_.size());
+            snapshot.write_int64(state.applied_ts_);
             uint64_t applied_ts = state.applied_ts_;
             for (auto [k, v] : state.fsm_) {
                 google::protobuf::ArenaOptions options;
