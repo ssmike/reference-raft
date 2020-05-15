@@ -295,7 +295,7 @@ private:
             }
         }
 
-        void advance_applied_timestmap() {
+        void advance_applied_timestamp() {
             durable_timestamps_[id_] = durable_ts_;
             std::vector<int64_t> tss;
             for (auto ts : durable_timestamps_) {
@@ -338,7 +338,7 @@ public:
         {
             auto state = state_.get();
             assert(options.bus_options.greeter.has_value());
-            id_ = *options.bus_options.greeter;
+            state->id_ = id_ = *options.bus_options.greeter;
             state->next_timestamps_.assign(options_.members, 0);
             state->durable_timestamps_.assign(options_.members, -1);
             state->follower_heartbeats_.assign(options_.members, std::chrono::system_clock::time_point::min());
@@ -351,14 +351,13 @@ public:
         register_handler<AppendRpcs, Response>(kAppendRpcs, std::bind(&RaftNode::handle_append_rpcs, this, _1, _2));
         register_handler<ClientRequest, ClientResponse>(kClientReq, std::bind(&RaftNode::handle_client_request, this, _1, _2));
         register_handler<RecoverySnapshot, Response>(kRecover, [&](int, RecoverySnapshot s) {
-            handle_recovery_snapshot(std::move(s));
-            return bus::make_future(Response());
+            return bus::make_future(handle_recovery_snapshot(std::move(s)));
         });
+        ProtoBus::start();
+
         sender_.delayed_start();
         elector_.delayed_start();
         stale_nodes_agent_.start();
-
-        ProtoBus::start();
     }
 
     bus::internal::Event& shot_down() {
@@ -366,18 +365,25 @@ public:
     }
 
 private:
-    void handle_recovery_snapshot(RecoverySnapshot s) {
+    Response handle_recovery_snapshot(RecoverySnapshot s) {
         auto state = state_.get();
         if (state->role_ != kFollower) {
-            return;
+            spdlog::info("not follower ignore snapshot");
+            return state->create_response(false);
         }
 
         if (s.applied_ts() < state->applied_ts_ || s.term() != state->current_term_) {
-            return;
+            spdlog::info("ignore snapshot with ts={0:d}, term={1:d} my ts={2:d} term={3:d}", s.applied_ts(), s.term(), state->applied_ts_, state->current_term_);
+            return state->create_response(false);
         }
 
+        //spdlog::info("handle recovery");
         std::pair<int64_t, int64_t> id = {s.term(), s.applied_ts()};
         if (!state->recovery_snapshot_id_ || *state->recovery_snapshot_id_ != id) {
+            if (!s.start()) {
+                spdlog::info("ignore new snapshot without start attribute");
+                return state->create_response(false);
+            }
             state->recovery_snapshot_io_.close();
             state->recovery_snapshot_id_ = id;
             // assert(!exists(snapshot_name(state->current_changelog_)));
@@ -386,6 +392,7 @@ private:
             state->recovery_snapshot_size_ = s.size();
             state->recovery_snapshot_io_.write_uint64(state->recovery_snapshot_size_);
             state->recovery_snapshot_io_.write_uint64(s.applied_ts());
+            spdlog::info("start writing snapshot for ts={0:d}; size={1:d}", s.applied_ts(), s.size());
         }
 
         for (auto& op : s.operations()) {
@@ -404,11 +411,15 @@ private:
                 state->applied_ts_ = s.applied_ts();
                 state->durable_ts_ = std::max(state->durable_ts_, state->applied_ts_);
                 state->next_ts_ = state->durable_ts_ + 1;
+                spdlog::info("sync recovery snapshot applied_ts={0:d}", s.applied_ts());
             } else {
+                spdlog::info("failed recovery {0:d} parts remain", state->recovery_snapshot_size_);
                 state->recovery_snapshot_io_.close();
                 state->recovery_snapshot_id_ = std::nullopt;
+                return state->create_response(false);
             }
         }
+        return state->create_response(true);
     }
 
     Response vote(VoteRpc rpc) {
@@ -482,6 +493,7 @@ private:
                 state->commit_subscribers_.insert({ rec.ts(), promise });
                 state->buffered_log_.push_back(std::move(rec));
                 sender_.trigger();
+                flusher_.trigger();
                 return promise.future().map([response=std::move(response)](bool) { return response; });
             }
         }
@@ -557,7 +569,7 @@ private:
                                 state->voted_for_me_.insert(id);
                                 if (state->voted_for_me_.size() > options_.members / 2) {
                                     state->role_ = kLeader;
-                                    state->advance_applied_timestmap();
+                                    state->advance_applied_timestamp();
                                     spdlog::info("becoming leader applied up to {0:d}", state->applied_ts_);
                                     state->commit_subscribers_.clear();
                                     state->durable_timestamps_.assign(options_.members, state->applied_ts_);
@@ -646,6 +658,13 @@ private:
             while (!snapshots.empty()) {
                 int64_t ts;
                 if (read_snapshot(io, snapshots.back(), ts, fsm)) {
+                    auto check_response = [&, first_portion=true] (RecoverySnapshot rec, uint64_t node) mutable {
+                        rec.set_start(first_portion);
+                        first_portion = false;
+                        auto f = send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout);
+                        auto& response = f.wait();
+                        return response && response.unwrap().success();
+                    };
                     if (next <= ts) {
                         spdlog::info("sending snapshot for ts={0:d} to {1:d}", ts, node);
                         RecoverySnapshot rec;
@@ -655,7 +674,8 @@ private:
                             op->set_value(item.second);
                             if (rec.operations_size() >= options_.rpc_max_batch) {
                                 rec.set_applied_ts(ts);
-                                if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
+                                rec.set_size(fsm.size());
+                                if (!check_response(std::move(rec), node)) {
                                     return;
                                 }
                                 rec.Clear();
@@ -663,8 +683,9 @@ private:
                         }
                         rec.set_term(term);
                         rec.set_applied_ts(ts);
+                        rec.set_size(fsm.size());
                         rec.set_end(true);
-                        if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
+                        if (!check_response(std::move(rec), node)) {
                             return;
                         }
                         next = ts + 1;
@@ -759,7 +780,7 @@ private:
                                 if (to_log) {
                                     spdlog::debug("node {2:d} responded with next_ts={0:d} durable_ts={1:d}", response.next_ts(), response.durable_ts(), id);
                                 }
-                                state->advance_applied_timestmap();
+                                state->advance_applied_timestamp();
                                 subscribers = state->pick_subscribers();
                             } else {
                                 spdlog::debug("node {0:d} failed heartbeat", id);
@@ -850,7 +871,7 @@ private:
             auto state = state_.get();
             state->durable_ts_ = durable_ts;
             if (state->role_ == kLeader) {
-                state->advance_applied_timestmap();
+                state->advance_applied_timestamp();
                 subscribers = state->pick_subscribers();
             }
         }
