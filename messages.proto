@@ -33,12 +33,12 @@ message Response {
 
 
 message RecoverySnapshot {
-    uint64 size = 1;
+    int64 size = 1;
     bool start = 7;
     bool end = 3;
 
     repeated Operation operations = 4;
 
-    int64 applied_ts = 5; 
+    int64 applied_ts = 5;
     int64 term = 6;
 };
