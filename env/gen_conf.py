@@ -28,7 +28,7 @@ confs = {
         'heartbeat_interval': 0.3,
         'heartbeat_timeout': 0.01,
         'election_timeout': 4,
-        'rotate_interval': 20,
+        'rotate_interval': 200,
         'applied_backlog': 0,
         'flush_interval': 0.005,
         'timeout': 2,
