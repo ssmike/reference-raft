@@ -1,3 +1,3 @@
 [submodule "bus"]
 	path = bus
-	url = git@github.com:ssmike/bus
+	url = https://github.com/ssmike/bus
