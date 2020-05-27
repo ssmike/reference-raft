@@ -600,7 +600,7 @@ private:
             state->leader_id_ = id;
 
             for (auto& rpc : msg.records()) {
-                if (rpc.ts() < state->applied_ts_) {
+                if (rpc.ts() <= state->applied_ts_) {
                     continue;
                 }
                 if (state->next_ts_ > rpc.ts()) {
@@ -610,7 +610,6 @@ private:
                     }
                     state->next_ts_ = rpc.ts();
                     state->durable_ts_ = std::min<ssize_t>(state->durable_ts_, rpc.ts() - 1);
-                    assert(state->applied_ts_ < rpc.ts());
                 }
                 if (rpc.ts() == state->next_ts_) {
                     state->buffered_log_.push_back(rpc);
@@ -1113,9 +1112,9 @@ int main(int argc, char** argv) {
 
     spdlog::set_pattern("[%H:%M:%S.%e] [" + std::to_string(id) + "] [%^%l%$] %v");
 
-#ifndef NDEBUG
-    spdlog::set_level(spdlog::level::debug);
-#endif
+    if (auto level = conf["log_level"]; !level.isNull() && level.asString() == "debug") {
+        spdlog::set_level(spdlog::level::debug);
+    }
 
     spdlog::info("starting node");
 
