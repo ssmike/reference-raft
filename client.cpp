@@ -9,10 +9,12 @@
 #include <json/reader.h>
 #include <fstream>
 
+#define ensure(condition) if (!(condition)) { throw std::logic_error("condition not met " #condition); }
+
 using duration = std::chrono::system_clock::duration;
 
 duration parse_duration(const Json::Value& val) {
-    assert(!val.isNull());
+    ensure(!val.isNull());
     return std::chrono::duration_cast<duration>(std::chrono::duration<double>(val.asFloat()));
 }
 
@@ -82,8 +84,56 @@ private:
     std::atomic<size_t> leader_ = 0;
 };
 
+template<typename F>
+std::chrono::steady_clock::duration measure(F&& f, size_t repeats = 1) {
+    auto pt = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < repeats; ++i) {
+        f();
+    }
+    return std::chrono::steady_clock::now() - pt;
+}
+
+void print_statistics(std::vector<std::chrono::steady_clock::duration>& times, std::string header) {
+    std::cout << "stats for " << header << std::endl;
+    std::chrono::steady_clock::duration sum = std::chrono::steady_clock::duration::zero();
+    std::sort(times.begin(), times.end());
+    for (auto time : times) {
+        sum += time;
+    }
+    std::cout << "avg " << std::chrono::duration_cast<std::chrono::nanoseconds>(sum / times.size()).count() << "ns" << std::endl;
+    std::cout << "min " << std::chrono::duration_cast<std::chrono::nanoseconds>(times[0]).count() << "ns" << std::endl;
+    std::cout << "max " << std::chrono::duration_cast<std::chrono::nanoseconds>(times.back()).count() << "ns" << std::endl;
+    ssize_t q50 = std::min<ssize_t>(times.size() * 0.5, ssize_t(times.size()) - 1);
+    std::cout << "q50 " << std::chrono::duration_cast<std::chrono::nanoseconds>(times[q50]).count() << "ns" << std::endl;
+    ssize_t q90 = std::min<ssize_t>(times.size() * 0.9, ssize_t(times.size()) - 1);
+    std::cout << "q90 " << std::chrono::duration_cast<std::chrono::nanoseconds>(times[q90]).count() << "ns" << std::endl;
+}
+
+void basic_workload(Client& client, size_t members) {
+    ensure(client.write("key", "value"));
+    ensure(client.lookup("key").unwrap() == "value");
+}
+
+void one_thread_latency(Client& client, size_t members) {
+    constexpr size_t N = 10000;
+    std::vector<std::chrono::steady_clock::duration> writes, reads;
+    for (size_t i = 0; i < N; ++i) {
+        std::string key = std::to_string(i);
+        std::string value = std::to_string(2 * i);
+        writes.push_back(measure([&] { ensure(client.write(key, value));}));
+    }
+    std::cerr << "checking values" << std::endl;
+    for (size_t i = 0; i < N; ++i) {
+        std::string key = std::to_string(i);
+        std::string value = std::to_string(2 * i);
+        reads.push_back(measure([&] { ensure(client.lookup(key).unwrap() == value); }));
+    }
+    print_statistics(writes, "writes");
+    print_statistics(reads, "reads");
+}
+
 int main(int argc, char** argv) {
-    assert(argc == 2);
+    ensure(argc == 2);
     Json::Value conf;
     std::ifstream(argv[1]) >> conf;
 
@@ -104,6 +154,9 @@ int main(int argc, char** argv) {
 
     Client client(opts, manager, members.size(), parse_duration(conf["timeout"]));
 
-    assert(client.write("key", "value"));
-    assert(client.lookup("key").unwrap() == "value");
+    std::map<std::string, void(*)(Client&, size_t)> workloads;
+    workloads["basic"] = &basic_workload;
+    workloads["one_thread"] = &one_thread_latency;
+
+    workloads[conf["workload"].asString()](client, members.size());
 }
