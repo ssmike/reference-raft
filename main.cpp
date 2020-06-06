@@ -246,9 +246,16 @@ private:
         std::vector<LogRecord> buffered_log_;
         bus::Promise<bool> flush_event_;
 
-        std::unordered_map<std::string, std::string> fsm_;
+        std::map<std::string, std::string> fsm_;
 
         size_t current_changelog_ = 0;
+
+        bool match_message(const LogRecord& rec) {
+            if (buffered_log_.empty() || rec.ts() < buffered_log_[0].ts() || rec.ts() > buffered_log_.back().ts()) {
+                return true;
+            }
+            return buffered_log_[rec.ts() - buffered_log_[0].ts()].SerializeAsString() != rec.SerializeAsString();
+        }
 
         std::vector<std::chrono::system_clock::time_point> follower_heartbeats_;
         std::chrono::system_clock::time_point latest_heartbeat_;
@@ -604,6 +611,9 @@ private:
                     continue;
                 }
                 if (state->next_ts_ > rpc.ts()) {
+                    if (state->match_message(rpc)) {
+                        continue;
+                    }
                     if (state->buffered_log_.size() > 0) {
                         state->buffered_log_.resize(std::max<ssize_t>(0, rpc.ts() - state->buffered_log_[0].ts() + 1));
                         state->flushed_index_ = std::min(state->flushed_index_, state->buffered_log_.size());
@@ -654,7 +664,7 @@ private:
             uint64_t snapshot_ts = 0;
             spdlog::info("starting recovery for {0:d} ts={1:d}", node, next);
             auto snapshots = discover_snapshots();
-            std::unordered_map<std::string, std::string> fsm;
+            std::map<std::string, std::string> fsm;
             while (!snapshots.empty()) {
                 int64_t ts;
                 if (read_snapshot(io, snapshots.back(), ts, fsm)) {
@@ -903,7 +913,7 @@ private:
         to_deliver.set_value_once(true);
     }
 
-    bool read_snapshot(BufferedFile& io, int number, int64_t& ts, std::unordered_map<std::string, std::string>& fsm) {
+    bool read_snapshot(BufferedFile& io, int number, int64_t& ts, std::map<std::string, std::string>& fsm) {
         auto fname = snapshot_name(number);
         io.set_fd(open(fname.c_str(), O_RDONLY));
         bool valid = true;

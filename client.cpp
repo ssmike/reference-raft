@@ -10,6 +10,7 @@
 #include <fstream>
 
 #define ensure(condition) if (!(condition)) { throw std::logic_error("condition not met " #condition); }
+#define verify(condition) if (!(condition)) { std::cerr << ("condition not met " #condition) << std::endl; std::terminate(); }
 
 using duration = std::chrono::system_clock::duration;
 
@@ -56,13 +57,17 @@ public:
         }
     }
 
-    bool write(std::string key, std::string value) {
+    bus::Future<bool> async_write(std::string key, std::string value) {
         ClientRequest req;
         auto* op = req.add_operations();
         op->set_type(ClientRequest::Operation::WRITE);
         op->set_key(std::move(key));
         op->set_value(std::move(value));
-        return execute(req).wait().success();
+        return execute(std::move(req)).map([](auto& err) { return err.success(); });
+    }
+
+    bool write(std::string key, std::string value) {
+        return async_write(std::move(key), std::move(value)).wait();
     }
 
 private:
@@ -90,7 +95,7 @@ std::chrono::steady_clock::duration measure(F&& f, size_t repeats = 1) {
     for (size_t i = 0; i < repeats; ++i) {
         f();
     }
-    return std::chrono::steady_clock::now() - pt;
+    return (std::chrono::steady_clock::now() - pt) / repeats;
 }
 
 void print_statistics(std::vector<std::chrono::steady_clock::duration>& times, std::string header) {
@@ -100,7 +105,7 @@ void print_statistics(std::vector<std::chrono::steady_clock::duration>& times, s
     for (auto time : times) {
         sum += time;
     }
-    std::cout << "avg " << std::chrono::duration_cast<std::chrono::nanoseconds>(sum / times.size()).count() << "ns" << std::endl;
+    std::cout << "avg " << std::chrono::duration_cast<std::chrono::nanoseconds>(sum/times.size()).count() << "ns" << std::endl;
     std::cout << "min " << std::chrono::duration_cast<std::chrono::nanoseconds>(times[0]).count() << "ns" << std::endl;
     std::cout << "max " << std::chrono::duration_cast<std::chrono::nanoseconds>(times.back()).count() << "ns" << std::endl;
     ssize_t q50 = std::min<ssize_t>(times.size() * 0.5, ssize_t(times.size()) - 1);
@@ -114,17 +119,57 @@ void basic_workload(Client& client, size_t members) {
     ensure(client.lookup("key").unwrap() == "value");
 }
 
+size_t maxinflight = 20;
+void parallel_workload(Client& client, size_t members) {
+    constexpr size_t repeats = 5000;
+    constexpr size_t mod = 10;
+    bus::internal::Event event;
+    bus::internal::ExclusiveWrapper<std::vector<std::chrono::steady_clock::duration>> times;
+    std::atomic_uint64_t inflight = 0;
+    for (size_t i = 0; i < repeats; ++i) {
+        event.reset();
+        std::string key = std::to_string(i % mod);
+        std::string value = std::to_string(2 * i);
+        auto pt = std::chrono::steady_clock::now();
+
+        event.reset();
+        while (inflight.load() >= maxinflight) {
+            event.wait();
+            event.reset();
+        }
+
+        inflight.fetch_add(1);
+        client.async_write(std::move(key), std::move(value))
+            .subscribe([&, pt] (auto& resp) {
+                inflight.fetch_sub(1);
+                auto time = std::chrono::steady_clock::now() - pt;
+                verify(resp);
+                event.notify();
+                times.get()->push_back(time);
+            });
+    }
+    event.reset();
+    while (inflight > 0) {
+        event.wait();
+        event.reset();
+    }
+
+    print_statistics(*times.get(), "writes");
+}
+
 void one_thread_latency(Client& client, size_t members) {
-    constexpr size_t N = 10000;
+    constexpr size_t N = 100;
+    constexpr size_t mod = 10;
     std::vector<std::chrono::steady_clock::duration> writes, reads;
     for (size_t i = 0; i < N; ++i) {
-        std::string key = std::to_string(i);
+        std::string key = std::to_string(i % mod);
         std::string value = std::to_string(2 * i);
         writes.push_back(measure([&] { ensure(client.write(key, value));}));
+        std::cerr << std::chrono::duration_cast<std::chrono::microseconds>(writes.back()).count() << " taken client write" << std::endl;
     }
     std::cerr << "checking values" << std::endl;
-    for (size_t i = 0; i < N; ++i) {
-        std::string key = std::to_string(i);
+    for (size_t i = N - mod; i < N; ++i) {
+        std::string key = std::to_string(i % mod);
         std::string value = std::to_string(2 * i);
         reads.push_back(measure([&] { ensure(client.lookup(key).unwrap() == value); }));
     }
@@ -157,6 +202,7 @@ int main(int argc, char** argv) {
     std::map<std::string, void(*)(Client&, size_t)> workloads;
     workloads["basic"] = &basic_workload;
     workloads["one_thread"] = &one_thread_latency;
+    workloads["parallel"] = &parallel_workload;
 
     workloads[conf["workload"].asString()](client, members.size());
 }
