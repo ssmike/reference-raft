@@ -234,6 +234,7 @@ private:
         ssize_t durable_ts_ = -1;
         ssize_t applied_ts_ = -1;
         ssize_t next_ts_ = 0;
+        ssize_t read_barrier_ts_ = -1;
 
         std::set<int> voted_for_me_;
 
@@ -472,6 +473,10 @@ private:
             if (state->role_ == kLeader) {
                 LogRecord rec;
                 ClientResponse response;
+                if (state->applied_ts_ < state->read_barrier_ts_) {
+                    response.set_success(false);
+                    return bus::make_future(std::move(response));
+                }
                 bool has_writes = false;
                 bool has_reads = false;
                 response.set_success(true);
@@ -576,7 +581,8 @@ private:
                                 if (state->voted_for_me_.size() > options_.members / 2) {
                                     state->role_ = kLeader;
                                     state->advance_applied_timestamp();
-                                    spdlog::info("becoming leader applied up to {0:d}", state->applied_ts_);
+                                    state->read_barrier_ts_ = state->durable_ts_;
+                                    spdlog::info("becoming leader applied up to {0:d} barrier ts {1:d}", state->applied_ts_, state->read_barrier_ts_);
                                     state->commit_subscribers_.clear();
                                     for (auto & ts : state->durable_timestamps_) {
                                         ts = std::min(ts, state->applied_ts_);
