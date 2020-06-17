@@ -34,7 +34,7 @@ public:
 
     bus::Future<ClientResponse> execute(ClientRequest req) {
         return bound_execute(req, leader_.load())
-            .chain([&] (ClientResponse& resp) {
+            .chain([=] (ClientResponse& resp) {
                     if (resp.should_retry()) {
                         leader_.store(resp.retry_to());
                         return bound_execute(req, resp.retry_to());
@@ -114,13 +114,13 @@ void print_statistics(std::vector<std::chrono::steady_clock::duration>& times, s
     std::cout << "q90 " << std::chrono::duration_cast<std::chrono::nanoseconds>(times[q90]).count() << "ns" << std::endl;
 }
 
-void basic_workload(Client& client, size_t members) {
+void basic_workload(Client& client) {
     ensure(client.write("key", "value"));
     ensure(client.lookup("key").unwrap() == "value");
 }
 
 size_t maxinflight = 20;
-void parallel_workload(Client& client, size_t members) {
+void parallel_workload(Client& client) {
     constexpr size_t repeats = 5000;
     constexpr size_t mod = 10;
     bus::internal::Event event;
@@ -157,7 +157,14 @@ void parallel_workload(Client& client, size_t members) {
     print_statistics(*times.get(), "writes");
 }
 
-void one_thread_latency(Client& client, size_t members) {
+void counter(Client& client) {
+    constexpr size_t repeats = 5000;
+    for (size_t i = 0; i < repeats; ++i) {
+        client.write("counter", std::to_string(i));
+    }
+}
+
+void one_thread_latency(Client& client) {
     constexpr size_t N = 100;
     constexpr size_t mod = 10;
     std::vector<std::chrono::steady_clock::duration> writes, reads;
@@ -199,10 +206,11 @@ int main(int argc, char** argv) {
 
     Client client(opts, manager, members.size(), parse_duration(conf["timeout"]));
 
-    std::map<std::string, void(*)(Client&, size_t)> workloads;
+    std::map<std::string, void(*)(Client&)> workloads;
     workloads["basic"] = &basic_workload;
     workloads["one_thread"] = &one_thread_latency;
     workloads["parallel"] = &parallel_workload;
+    workloads["counter"] = &counter;
 
-    workloads[conf["workload"].asString()](client, members.size());
+    workloads[conf["workload"].asString()](client);
 }
