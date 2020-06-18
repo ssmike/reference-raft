@@ -1,7 +1,7 @@
 #include "proto_bus.h"
 #include "messages.pb.h"
 #include "lock.h"
-#include "executor.h"
+#include "delayed_executor.h"
 #include "error.h"
 #include "client.pb.h"
 
@@ -356,8 +356,8 @@ public:
         flusher_.start();
         using namespace std::placeholders;
         register_handler<VoteRpc, Response>(kVote, [&] (int, VoteRpc rpc) { return bus::make_future(vote(rpc)); });
-        register_handler<AppendRpcs, Response>(kAppendRpcs, std::bind(&RaftNode::handle_append_rpcs, this, _1, _2));
-        register_handler<ClientRequest, ClientResponse>(kClientReq, std::bind(&RaftNode::handle_client_request, this, _1, _2));
+        register_handler<AppendRpcs, Response>(kAppendRpcs, [=] (int node, AppendRpcs rpcs) { return handle_append_rpcs(node, std::move(rpcs)); });
+        register_handler<ClientRequest, ClientResponse>(kClientReq, [=](int node, ClientRequest req) { return handle_client_request(node, std::move(req)); } );
         register_handler<RecoverySnapshot, Response>(kRecover, [&](int, RecoverySnapshot s) {
             return bus::make_future(handle_recovery_snapshot(std::move(s)));
         });
