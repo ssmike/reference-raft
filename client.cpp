@@ -184,6 +184,21 @@ void one_thread_latency(Client& client) {
     print_statistics(reads, "reads");
 }
 
+void many_writes(Client& client) {
+    constexpr size_t N = 15000;
+    constexpr size_t mod = 10;
+    std::vector<std::chrono::steady_clock::duration> writes, reads;
+    for (size_t i = 0; i < N; ++i) {
+        std::string key = std::to_string(i);
+        std::string value;
+        for (int j = 0; j < 1000; ++j) {
+            value.push_back('a' + (i+j)%mod);
+        }
+        writes.push_back(measure([&] { ensure(client.write(key, value));}));
+    }
+    print_statistics(writes, "writes");
+}
+
 int main(int argc, char** argv) {
     ensure(argc == 2);
     Json::Value conf;
@@ -211,6 +226,7 @@ int main(int argc, char** argv) {
     workloads["one_thread"] = &one_thread_latency;
     workloads["parallel"] = &parallel_workload;
     workloads["counter"] = &counter;
+    workloads["many_writes"] = &many_writes;
 
     workloads[conf["workload"].asString()](client);
 }
